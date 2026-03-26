@@ -5,7 +5,7 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 
-interface Env { DB: D1Database; CACHE: KVNamespace; ENGINE_RUNTIME: Fetcher; SHARED_BRAIN: Fetcher; }
+interface Env { DB: D1Database; CACHE: KVNamespace; ENGINE_RUNTIME: Fetcher; SHARED_BRAIN: Fetcher; ECHO_API_KEY?: string; }
 interface RLState { c: number; t: number }
 
 const app = new Hono<{ Bindings: Env }>();
@@ -34,6 +34,20 @@ app.use('*', async (c, next) => {
   const ip = c.req.header('cf-connecting-ip') || 'unknown';
   const isWrite = ['POST','PUT','PATCH','DELETE'].includes(c.req.method);
   if (await rateLimit(c.env.CACHE, `${ip}:${isWrite ? 'w' : 'r'}`, isWrite ? 60 : 200)) return json({ error: 'Rate limited' }, 429);
+  return next();
+});
+
+// Auth middleware — require API key for write operations (public signing exempt)
+app.use('*', async (c, next) => {
+  const method = c.req.method;
+  const path = new URL(c.req.url).pathname;
+  if (method === 'GET' || method === 'OPTIONS' || method === 'HEAD' || path === '/health' || path === '/status' || path.startsWith('/sign/')) return next();
+  const apiKey = c.req.header('X-Echo-API-Key') || '';
+  const bearer = (c.req.header('Authorization') || '').replace('Bearer ', '');
+  const expected = c.env.ECHO_API_KEY;
+  if (!expected || (apiKey !== expected && bearer !== expected)) {
+    return json({ error: 'Unauthorized', message: 'Valid X-Echo-API-Key or Bearer token required for write operations' }, 401);
+  }
   return next();
 });
 
