@@ -1,0 +1,26 @@
+name = "echo-contracts"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[observability]
+enabled = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-contracts"
+database_id = "cfea4840-cddb-49e9-ab83-7c0cf09d7df5"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "f6337984c8264fc29de67041445bb85b"
+
+[[services]]
+binding = "ENGINE_RUNTIME"
+service = "echo-engine-runtime"
+
+[[services]]
+binding = "SHARED_BRAIN"
+service = "echo-shared-brain"
+
+[triggers]
+crons = ["0 4 * * *"]
