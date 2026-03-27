@@ -17,6 +17,13 @@ const sanitizeBody = (o: Record<string, unknown>) => { const r: Record<string, u
 const tid = (c: any) => c.req.header('X-Tenant-ID') || c.req.query('tenant_id') || '';
 const json = (d: unknown, s = 200) => new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 
+// CORS headers (auto-added by Evolution Engine)
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, X-Echo-API-Key',
+};
+
 async function rateLimit(kv: KVNamespace, key: string, limit: number, windowSec = 60): Promise<boolean> {
   const rlKey = `rl:${key}`; const now = Date.now();
   const raw = await kv.get(rlKey);
