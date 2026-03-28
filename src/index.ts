@@ -35,6 +35,12 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Headers': 'Content-Type, X-Echo-API-Key',
 };
 
+function slog(level: 'info' | 'warn' | 'error', msg: string, data?: Record<string, unknown>) {
+  const entry = { ts: new Date().toISOString(), level, worker: 'echo-contracts', version: '1.0.0', msg, ...data };
+  if (level === 'error') console.error(JSON.stringify(entry));
+  else console.log(JSON.stringify(entry));
+}
+
 async function rateLimit(kv: KVNamespace, key: string, limit: number, windowSec = 60): Promise<boolean> {
   const rlKey = `rl:${key}`; const now = Date.now();
   const raw = await kv.get(rlKey);
