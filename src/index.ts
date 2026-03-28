@@ -58,6 +58,7 @@ app.use('*', async (c, next) => {
   return next();
 });
 
+app.get('/', (c) => c.redirect('/health'));
 app.get('/health', (c) => json({ status: 'ok', service: 'echo-contracts', version: '1.0.0', time: new Date().toISOString() }));
 
 // ═══════════════ TENANTS ═══════════════
