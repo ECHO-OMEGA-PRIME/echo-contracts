@@ -250,13 +250,20 @@ app.post('/sign/:token', async (c) => {
   if (!sig) return json({ error: 'Invalid or already signed' }, 404);
   const ip = c.req.header('cf-connecting-ip') || 'unknown';
   const ua = c.req.header('user-agent') || 'unknown';
-  await c.env.DB.prepare("UPDATE signatures SET status='signed',ip_address=?,user_agent=?,signed_at=datetime('now') WHERE id=?").bind(ip, ua, sig.id).run();
-  // Check if all signers have signed
-  const pending = await c.env.DB.prepare("SELECT COUNT(*) as c FROM signatures WHERE contract_id=? AND status='pending'").bind(sig.contract_id).first() as any;
-  if (pending.c === 0) {
-    await c.env.DB.prepare("UPDATE contracts SET status='active',signed_at=datetime('now'),updated_at=datetime('now') WHERE id=?").bind(sig.contract_id).run();
+  // Batch sign + pending check atomically to prevent race condition with concurrent signers
+  const results = await c.env.DB.batch([
+    c.env.DB.prepare("UPDATE signatures SET status='signed',ip_address=?,user_agent=?,signed_at=datetime('now') WHERE id=? AND status='pending'").bind(ip, ua, sig.id),
+    c.env.DB.prepare("SELECT COUNT(*) as c FROM signatures WHERE contract_id=? AND status='pending'").bind(sig.contract_id),
+  ]);
+  // Verify the signature update actually happened (prevent double-sign)
+  const signResult = results[0] as D1Result;
+  if (!signResult.meta?.changes) return json({ error: 'Already signed' }, 409);
+  const pending = (results[1] as D1Result<{ c: number }>).results?.[0];
+  const allSigned = pending?.c === 0;
+  if (allSigned) {
+    await c.env.DB.prepare("UPDATE contracts SET status='active',signed_at=datetime('now'),updated_at=datetime('now') WHERE id=? AND status!='active'").bind(sig.contract_id).run();
   }
-  return json({ signed: true, all_signed: pending.c === 0 });
+  return json({ signed: true, all_signed: allSigned });
 });
 app.post('/sign/:token/decline', async (c) => {
   const b = sanitizeBody(await c.req.json());
