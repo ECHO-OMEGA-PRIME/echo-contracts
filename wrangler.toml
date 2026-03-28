@@ -22,6 +22,10 @@ service = "echo-engine-runtime"
 binding = "SHARED_BRAIN"
 service = "echo-shared-brain"
 
+[[services]]
+binding = "EMAIL_SENDER"
+service = "echo-email-sender"
+
 [triggers]
 crons = ["0 4 * * *"]
 

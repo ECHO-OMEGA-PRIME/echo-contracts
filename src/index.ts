@@ -1,11 +1,11 @@
 /**
- * Echo Contracts v1.0.0 — AI-Powered Contract Management & E-Signatures
+ * Echo Contracts v2.0.0 — AI-Powered Contract Management, E-Signatures & Stripe Payments
  * Cloudflare Worker with Hono, D1, KV, service bindings
  */
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 
-interface Env { DB: D1Database; CACHE: KVNamespace; ENGINE_RUNTIME: Fetcher; SHARED_BRAIN: Fetcher; ECHO_API_KEY?: string; }
+interface Env { DB: D1Database; CACHE: KVNamespace; ENGINE_RUNTIME: Fetcher; SHARED_BRAIN: Fetcher; EMAIL_SENDER: Fetcher; ECHO_API_KEY?: string; STRIPE_SECRET_KEY?: string; STRIPE_WEBHOOK_SECRET?: string; CONTRACT_HMAC_KEY?: string; SITE_URL?: string; }
 interface RLState { c: number; t: number }
 
 const app = new Hono<{ Bindings: Env }>();
@@ -36,9 +36,32 @@ const CORS_HEADERS = {
 };
 
 function slog(level: 'info' | 'warn' | 'error', msg: string, data?: Record<string, unknown>) {
-  const entry = { ts: new Date().toISOString(), level, worker: 'echo-contracts', version: '1.0.0', msg, ...data };
+  const entry = { ts: new Date().toISOString(), level, worker: 'echo-contracts', version: '2.0.0', msg, ...data };
   if (level === 'error') console.error(JSON.stringify(entry));
   else console.log(JSON.stringify(entry));
+}
+
+async function generatePaymentToken(contractId: string, tenantId: string, hmacKey: string): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(hmacKey), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(`${contractId}:${tenantId}`));
+  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function verifyStripeSignature(payload: string, header: string, secret: string): Promise<boolean> {
+  const parts = header.split(',').reduce((acc: Record<string, string>, p) => { const [k, v] = p.split('='); acc[k.trim()] = v; return acc; }, {});
+  const timestamp = parts['t']; const signature = parts['v1'];
+  if (!timestamp || !signature) return false;
+  const age = Math.floor(Date.now() / 1000) - parseInt(timestamp);
+  if (age > 300 || age < -60) return false;
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(`${timestamp}.${payload}`));
+  const expected = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+  if (expected.length !== signature.length) return false;
+  let result = 0;
+  for (let i = 0; i < expected.length; i++) result |= expected.charCodeAt(i) ^ signature.charCodeAt(i);
+  return result === 0;
 }
 
 async function rateLimit(kv: KVNamespace, key: string, limit: number, windowSec = 60): Promise<boolean> {
@@ -54,7 +77,7 @@ async function rateLimit(kv: KVNamespace, key: string, limit: number, windowSec 
 
 app.use('*', async (c, next) => {
   const path = new URL(c.req.url).pathname;
-  if (path === '/health' || path === '/status' || path.startsWith('/sign/')) return next();
+  if (path === '/health' || path === '/status' || path.startsWith('/sign/') || path.startsWith('/public/') || path === '/webhooks/stripe') return next();
   const ip = c.req.header('cf-connecting-ip') || 'unknown';
   const isWrite = ['POST','PUT','PATCH','DELETE'].includes(c.req.method);
   if (await rateLimit(c.env.CACHE, `${ip}:${isWrite ? 'w' : 'r'}`, isWrite ? 60 : 200)) return json({ error: 'Rate limited' }, 429);
@@ -65,7 +88,7 @@ app.use('*', async (c, next) => {
 app.use('*', async (c, next) => {
   const method = c.req.method;
   const path = new URL(c.req.url).pathname;
-  if (method === 'GET' || method === 'OPTIONS' || method === 'HEAD' || path === '/health' || path === '/status' || path.startsWith('/sign/')) return next();
+  if (method === 'GET' || method === 'OPTIONS' || method === 'HEAD' || path === '/health' || path === '/status' || path.startsWith('/sign/') || path.startsWith('/public/') || path === '/webhooks/stripe') return next();
   const apiKey = c.req.header('X-Echo-API-Key') || '';
   const bearer = (c.req.header('Authorization') || '').replace('Bearer ', '');
   const expected = c.env.ECHO_API_KEY;
@@ -75,8 +98,8 @@ app.use('*', async (c, next) => {
   return next();
 });
 
-app.get('/', (c) => c.json({ service: 'echo-contracts', version: '1.0.0', status: 'operational' }));
-app.get('/health', (c) => json({ status: 'ok', service: 'echo-contracts', version: '1.0.0', time: new Date().toISOString() }));
+app.get('/', (c) => c.json({ service: 'echo-contracts', version: '2.0.0', status: 'operational', features: ['stripe-checkout', 'payment-links', 'public-portal', 'e-signatures', 'version-control'] }));
+app.get('/health', (c) => json({ status: 'ok', service: 'echo-contracts', version: '2.0.0', stripe: !!c.env.STRIPE_SECRET_KEY, time: new Date().toISOString() }));
 
 // ═══════════════ TENANTS ═══════════════
 app.post('/tenants', async (c) => {
@@ -293,6 +316,200 @@ app.post('/contracts/:id/comments', async (c) => {
 app.post('/comments/:id/resolve', async (c) => {
   await c.env.DB.prepare('UPDATE comments SET is_resolved=1 WHERE id=? AND tenant_id=?').bind(c.req.param('id'), tid(c)).run();
   return json({ resolved: true });
+});
+
+// ═══════════════ STRIPE CHECKOUT ═══════════════
+// Generate payment link for a contract
+app.post('/contracts/:id/payment-link', async (c) => {
+  if (!c.env.CONTRACT_HMAC_KEY) return json({ error: 'Payment links not configured' }, 503);
+  const contract = await c.env.DB.prepare('SELECT * FROM contracts WHERE id=? AND tenant_id=?').bind(c.req.param('id'), tid(c)).first() as any;
+  if (!contract) return json({ error: 'Contract not found' }, 404);
+  if (!contract.value || contract.value <= 0) return json({ error: 'Contract has no payment value' }, 400);
+  const token = await generatePaymentToken(contract.id, contract.tenant_id, c.env.CONTRACT_HMAC_KEY);
+  await c.env.DB.prepare("UPDATE contracts SET payment_token=?,payment_required=1,updated_at=datetime('now') WHERE id=?").bind(token, contract.id).run();
+  const base = c.env.SITE_URL || new URL(c.req.url).origin;
+  const paymentUrl = `${base}/public/contract/${contract.id}?token=${token}`;
+  slog('info', 'Payment link generated', { contract_id: contract.id, value: contract.value });
+  return json({ payment_url: paymentUrl, token, contract_number: contract.contract_number, value: contract.value, currency: contract.currency });
+});
+
+// Create Stripe Checkout session for contract payment
+app.post('/contracts/:id/checkout', async (c) => {
+  if (!c.env.STRIPE_SECRET_KEY) return json({ error: 'Stripe not configured' }, 503);
+  const contract = await c.env.DB.prepare('SELECT c.*, co.email as counterparty_email FROM contracts c LEFT JOIN contacts co ON c.counterparty_id=co.id WHERE c.id=? AND c.tenant_id=?').bind(c.req.param('id'), tid(c)).first() as any;
+  if (!contract) return json({ error: 'Contract not found' }, 404);
+  if (contract.status === 'terminated' || contract.status === 'expired') return json({ error: `Cannot pay ${contract.status} contract` }, 400);
+  if (!contract.value || contract.value <= 0) return json({ error: 'No payment amount' }, 400);
+  const amountCents = Math.round(Number(contract.value) * 100);
+  const base = c.env.SITE_URL || new URL(c.req.url).origin;
+  const params = new URLSearchParams();
+  params.set('mode', 'payment');
+  params.set('payment_method_types[]', 'card');
+  params.set('line_items[0][price_data][currency]', (contract.currency || 'usd').toLowerCase());
+  params.set('line_items[0][price_data][unit_amount]', String(amountCents));
+  params.set('line_items[0][price_data][product_data][name]', `Contract: ${contract.title}`);
+  params.set('line_items[0][price_data][product_data][description]', `Contract #${contract.contract_number}`);
+  params.set('line_items[0][quantity]', '1');
+  params.set('success_url', `${base}/public/contract/${contract.id}?paid=true`);
+  params.set('cancel_url', `${base}/public/contract/${contract.id}?token=${contract.payment_token || ''}`);
+  params.set('metadata[contract_id]', contract.id);
+  params.set('metadata[tenant_id]', contract.tenant_id);
+  params.set('metadata[contract_number]', contract.contract_number);
+  if (contract.counterparty_email) params.set('customer_email', contract.counterparty_email);
+  try {
+    const res = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${c.env.STRIPE_SECRET_KEY}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString(),
+    });
+    const session = await res.json() as any;
+    if (!res.ok) { slog('error', 'Stripe checkout failed', { status: res.status, error: session }); return json({ error: session.error?.message || 'Stripe error' }, 502); }
+    await c.env.DB.prepare("UPDATE contracts SET stripe_checkout_id=?,updated_at=datetime('now') WHERE id=?").bind(session.id, contract.id).run();
+    slog('info', 'Stripe checkout created', { contract_id: contract.id, session_id: session.id, amount: amountCents });
+    return json({ checkout_url: session.url, session_id: session.id });
+  } catch (e) { slog('error', 'Stripe API error', { error: String(e) }); return json({ error: 'Stripe unavailable' }, 502); }
+});
+
+// Public contract portal — token-verified, no auth needed
+app.get('/public/contract/:id', async (c) => {
+  const id = c.req.param('id');
+  const token = c.req.query('token') || '';
+  const contract = await c.env.DB.prepare('SELECT c.*, co.name as counterparty_contact_name, co.email as counterparty_email FROM contracts c LEFT JOIN contacts co ON c.counterparty_id=co.id WHERE c.id=?').bind(id).first() as any;
+  if (!contract) return json({ error: 'Contract not found' }, 404);
+  if (!contract.payment_token || contract.payment_token !== token) {
+    if (c.req.query('paid') !== 'true') return json({ error: 'Invalid payment token' }, 403);
+  }
+  const signatures = (await c.env.DB.prepare('SELECT signer_name,signer_role,status,signed_at FROM signatures WHERE contract_id=?').bind(id).all()).results;
+  const isPaid = contract.payment_status === 'paid';
+  const accept = c.req.header('Accept') || '';
+  if (accept.includes('application/json')) {
+    return json({ contract: { id: contract.id, title: contract.title, contract_number: contract.contract_number, status: contract.status, value: contract.value, currency: contract.currency, counterparty_name: contract.counterparty_name, start_date: contract.start_date, end_date: contract.end_date, payment_status: contract.payment_status || 'unpaid', payment_required: contract.payment_required }, signatures });
+  }
+  // Render HTML portal
+  const statusColors: Record<string, string> = { draft: '#6b7280', review: '#f59e0b', sent: '#3b82f6', active: '#10b981', expired: '#ef4444', terminated: '#dc2626' };
+  const statusColor = statusColors[contract.status] || '#6b7280';
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Contract ${contract.contract_number}</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f8fafc;color:#1e293b}
+.top{background:#0f172a;color:#fff;padding:16px 24px;display:flex;justify-content:space-between;align-items:center}.top h1{font-size:18px;font-weight:600}
+.badge{display:inline-block;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:700;text-transform:uppercase;color:#fff}
+.card{background:#fff;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,0.1);margin:24px auto;max-width:700px;padding:32px}
+.row{display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid #f1f5f9}.row:last-child{border:none}
+.label{color:#64748b;font-size:14px}.val{font-weight:600;font-size:14px}
+.total{font-size:28px;font-weight:700;color:#0f172a;text-align:center;padding:24px 0}
+.btn{display:block;width:100%;padding:16px;border:none;border-radius:8px;font-size:16px;font-weight:700;cursor:pointer;text-align:center;text-decoration:none;margin-top:16px}
+.btn-pay{background:#4f46e5;color:#fff}.btn-pay:hover{background:#4338ca}
+.btn-paid{background:#10b981;color:#fff;cursor:default}
+.sigs{margin-top:16px}.sig{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f1f5f9;font-size:13px}
+.sig-signed{color:#10b981}.sig-pending{color:#f59e0b}
+</style></head><body>
+<div class="top"><h1>Contract ${sanitize(contract.contract_number, 50)}</h1><span class="badge" style="background:${statusColor}">${contract.status}</span></div>
+<div class="card">
+<h2 style="margin-bottom:16px">${sanitize(contract.title, 200)}</h2>
+<div class="row"><span class="label">Counterparty</span><span class="val">${sanitize(contract.counterparty_name || 'N/A', 100)}</span></div>
+<div class="row"><span class="label">Type</span><span class="val">${contract.type || 'general'}</span></div>
+<div class="row"><span class="label">Start Date</span><span class="val">${contract.start_date || 'TBD'}</span></div>
+<div class="row"><span class="label">End Date</span><span class="val">${contract.end_date || 'TBD'}</span></div>
+<div class="row"><span class="label">Renewal</span><span class="val">${contract.auto_renew ? 'Auto-renew' : contract.renewal_type || 'Manual'}</span></div>
+${contract.value ? `<div class="total">${(contract.currency || 'USD').toUpperCase()} $${Number(contract.value).toLocaleString('en-US', { minimumFractionDigits: 2 })}</div>` : ''}
+${signatures.length ? `<div class="sigs"><h3 style="margin-bottom:8px;font-size:14px;color:#64748b">Signatures</h3>${(signatures as any[]).map((s: any) => `<div class="sig"><span>${sanitize(s.signer_name, 100)} (${s.signer_role})</span><span class="${s.status === 'signed' ? 'sig-signed' : 'sig-pending'}">${s.status === 'signed' ? 'Signed ' + (s.signed_at || '') : s.status}</span></div>`).join('')}</div>` : ''}
+${isPaid ? '<a class="btn btn-paid">Payment Received</a>' : (contract.value > 0 && contract.payment_required) ? `<form method="POST" action="/public/contract/${contract.id}/pay?token=${token}"><button type="submit" class="btn btn-pay">Pay $${Number(contract.value).toLocaleString('en-US', { minimumFractionDigits: 2 })} Now</button></form>` : ''}
+</div>
+<p style="text-align:center;color:#94a3b8;font-size:12px;padding:16px">Powered by Echo Contracts</p>
+</body></html>`;
+  return new Response(html, { headers: { 'Content-Type': 'text/html;charset=utf-8' } });
+});
+
+// Public payment trigger — creates Stripe Checkout and redirects
+app.post('/public/contract/:id/pay', async (c) => {
+  if (!c.env.STRIPE_SECRET_KEY) return json({ error: 'Payments not configured' }, 503);
+  const id = c.req.param('id');
+  const token = c.req.query('token') || '';
+  const contract = await c.env.DB.prepare('SELECT c.*, co.email as counterparty_email FROM contracts c LEFT JOIN contacts co ON c.counterparty_id=co.id WHERE c.id=?').bind(id).first() as any;
+  if (!contract) return json({ error: 'Not found' }, 404);
+  if (!contract.payment_token || contract.payment_token !== token) return json({ error: 'Invalid token' }, 403);
+  if (contract.payment_status === 'paid') return json({ error: 'Already paid' }, 400);
+  if (!contract.value || contract.value <= 0) return json({ error: 'No amount' }, 400);
+  const amountCents = Math.round(Number(contract.value) * 100);
+  const base = c.env.SITE_URL || new URL(c.req.url).origin;
+  const params = new URLSearchParams();
+  params.set('mode', 'payment');
+  params.set('payment_method_types[]', 'card');
+  params.set('line_items[0][price_data][currency]', (contract.currency || 'usd').toLowerCase());
+  params.set('line_items[0][price_data][unit_amount]', String(amountCents));
+  params.set('line_items[0][price_data][product_data][name]', `Contract: ${contract.title}`);
+  params.set('line_items[0][price_data][product_data][description]', `#${contract.contract_number}`);
+  params.set('line_items[0][quantity]', '1');
+  params.set('success_url', `${base}/public/contract/${id}?paid=true`);
+  params.set('cancel_url', `${base}/public/contract/${id}?token=${token}`);
+  params.set('metadata[contract_id]', id);
+  params.set('metadata[tenant_id]', contract.tenant_id);
+  params.set('metadata[contract_number]', contract.contract_number);
+  if (contract.counterparty_email) params.set('customer_email', contract.counterparty_email);
+  try {
+    const res = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${c.env.STRIPE_SECRET_KEY}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString(),
+    });
+    const session = await res.json() as any;
+    if (!res.ok) { slog('error', 'Stripe public checkout failed', { error: session }); return json({ error: 'Payment service error' }, 502); }
+    await c.env.DB.prepare("UPDATE contracts SET stripe_checkout_id=?,updated_at=datetime('now') WHERE id=?").bind(session.id, id).run();
+    return new Response(null, { status: 303, headers: { Location: session.url } });
+  } catch (e) { slog('error', 'Stripe API error', { error: String(e) }); return json({ error: 'Payment unavailable' }, 502); }
+});
+
+// Stripe Webhook — verify signature, process payment events
+app.post('/webhooks/stripe', async (c) => {
+  const body = await c.req.text();
+  const sigHeader = c.req.header('Stripe-Signature') || '';
+  if (c.env.STRIPE_WEBHOOK_SECRET) {
+    if (!sigHeader) { slog('warn', 'Webhook missing signature'); return json({ error: 'Missing signature' }, 401); }
+    const valid = await verifyStripeSignature(body, sigHeader, c.env.STRIPE_WEBHOOK_SECRET);
+    if (!valid) { slog('warn', 'Webhook invalid signature', { ip: c.req.header('cf-connecting-ip') || '' }); return json({ error: 'Invalid signature' }, 401); }
+  }
+  let event: any;
+  try { event = JSON.parse(body); } catch { return json({ error: 'Invalid JSON' }, 400); }
+  slog('info', 'Stripe webhook received', { type: event.type, id: event.id });
+  try {
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const contractId = session.metadata?.contract_id;
+      const tenantId = session.metadata?.tenant_id;
+      if (contractId && session.payment_status === 'paid') {
+        await c.env.DB.batch([
+          c.env.DB.prepare("UPDATE contracts SET payment_status='paid',stripe_payment_intent=?,updated_at=datetime('now') WHERE id=?").bind(session.payment_intent || session.id, contractId),
+          c.env.DB.prepare("INSERT INTO activity_log (id,tenant_id,contract_id,action,actor,details) VALUES (?,?,?,?,?,?)").bind(uid(), tenantId || '', contractId, 'payment_received', 'stripe', JSON.stringify({ amount: session.amount_total, currency: session.currency, session_id: session.id, payment_intent: session.payment_intent })),
+        ]);
+        slog('info', 'Contract payment recorded', { contract_id: contractId, amount: session.amount_total });
+      }
+    } else if (event.type === 'checkout.session.expired') {
+      const session = event.data.object;
+      const contractId = session.metadata?.contract_id;
+      if (contractId) {
+        await c.env.DB.prepare("UPDATE contracts SET stripe_checkout_id=NULL,updated_at=datetime('now') WHERE id=? AND stripe_checkout_id=?").bind(contractId, session.id).run();
+        slog('info', 'Checkout expired', { contract_id: contractId });
+      }
+    }
+  } catch (e) { slog('error', 'Webhook processing error', { error: String(e), type: event.type }); }
+  return json({ received: true });
+});
+
+// Schema migration for Stripe payment columns
+app.post('/admin/migrate-stripe', async (c) => {
+  const cols = [
+    { name: 'payment_token', sql: "ALTER TABLE contracts ADD COLUMN payment_token TEXT" },
+    { name: 'payment_required', sql: "ALTER TABLE contracts ADD COLUMN payment_required INTEGER DEFAULT 0" },
+    { name: 'payment_status', sql: "ALTER TABLE contracts ADD COLUMN payment_status TEXT DEFAULT 'unpaid'" },
+    { name: 'stripe_checkout_id', sql: "ALTER TABLE contracts ADD COLUMN stripe_checkout_id TEXT" },
+    { name: 'stripe_payment_intent', sql: "ALTER TABLE contracts ADD COLUMN stripe_payment_intent TEXT" },
+  ];
+  const results: string[] = [];
+  for (const col of cols) {
+    try { await c.env.DB.prepare(col.sql).run(); results.push(`${col.name}: added`); }
+    catch (e: any) { results.push(`${col.name}: ${e.message?.includes('duplicate') ? 'exists' : e.message}`); }
+  }
+  slog('info', 'Stripe migration completed', { results });
+  return json({ migrated: true, results });
 });
 
 // ═══════════════ ANALYTICS ═══════════════
