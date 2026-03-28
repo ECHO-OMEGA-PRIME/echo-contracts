@@ -163,13 +163,19 @@ app.post('/contracts', async (c) => {
 app.put('/contracts/:id', async (c) => {
   const b = sanitizeBody(await c.req.json()); const cid = c.req.param('id'); const t = tid(c);
   await c.env.DB.prepare("UPDATE contracts SET title=COALESCE(?,title),description=COALESCE(?,description),type=COALESCE(?,type),content_json=COALESCE(?,content_json),variables_json=COALESCE(?,variables_json),counterparty_id=COALESCE(?,counterparty_id),counterparty_name=COALESCE(?,counterparty_name),value=COALESCE(?,value),start_date=COALESCE(?,start_date),end_date=COALESCE(?,end_date),renewal_type=COALESCE(?,renewal_type),tags=COALESCE(?,tags),updated_at=datetime('now') WHERE id=? AND tenant_id=?").bind(b.title||null, b.description||null, b.type||null, typeof b.content === 'object' ? JSON.stringify(b.content) : b.content_json||null, typeof b.variables === 'object' ? JSON.stringify(b.variables) : b.variables_json||null, b.counterparty_id||null, b.counterparty_name||null, b.value||null, b.start_date||null, b.end_date||null, b.renewal_type||null, b.tags||null, cid, t).run();
-  // Create new version if content changed
+  // Create new version if content changed (atomic version increment to prevent collision)
   if (b.content || b.content_json) {
-    const contract = await c.env.DB.prepare('SELECT current_version FROM contracts WHERE id=?').bind(cid).first() as any;
-    const newVersion = (contract?.current_version || 1) + 1;
+    const versionId = uid();
+    const contentVal = typeof b.content === 'object' ? JSON.stringify(b.content) : b.content_json;
     await c.env.DB.batch([
-      c.env.DB.prepare('INSERT INTO contract_versions (id,contract_id,tenant_id,version,content_json,change_summary,created_by) VALUES (?,?,?,?,?,?,?)').bind(uid(), cid, t, newVersion, typeof b.content === 'object' ? JSON.stringify(b.content) : b.content_json, b.change_summary||'Updated', b.updated_by||'system'),
-      c.env.DB.prepare('UPDATE contracts SET current_version=? WHERE id=?').bind(newVersion, cid),
+      c.env.DB.prepare(
+        `INSERT INTO contract_versions (id,contract_id,tenant_id,version,content_json,change_summary,created_by)
+         SELECT ?,?,?,COALESCE(MAX(version),0)+1,?,?,?
+         FROM contract_versions WHERE contract_id=?`
+      ).bind(versionId, cid, t, contentVal, b.change_summary||'Updated', b.updated_by||'system', cid),
+      c.env.DB.prepare(
+        'UPDATE contracts SET current_version=(SELECT MAX(version) FROM contract_versions WHERE contract_id=?) WHERE id=?'
+      ).bind(cid, cid),
     ]);
   }
   return json({ updated: true });
