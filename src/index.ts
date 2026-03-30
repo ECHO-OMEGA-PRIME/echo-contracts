@@ -35,6 +35,13 @@ function slog(level: 'info' | 'warn' | 'error', msg: string, data?: Record<strin
   else console.log(JSON.stringify(entry));
 }
 
+// CORS headers (auto-added by Evolution Engine)
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': 'https://echo-ept.com',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, X-Echo-API-Key',
+};
+
 async function generatePaymentToken(contractId: string, tenantId: string, hmacKey: string): Promise<string> {
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey('raw', enc.encode(hmacKey), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
